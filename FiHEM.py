@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from transformers import RobertaModel, RobertaTokenizer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 
 from efficient_kan import KAN as EfficientKAN
 
@@ -100,7 +101,7 @@ def parse_json_file(file_path):
                 try:
                     data.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    print(f"解析行时出错（跳过）: {line}\n错误: {e}")
+                    print(f"Error parsing line (skipped): {line}\nError: {e}")
     return data
 
 
@@ -208,7 +209,7 @@ from torch.utils.data import Sampler
 
 class BalancedBatchSampler(Sampler):
     def __init__(self, dataset, batch_size=64):
-        assert batch_size % 2 == 0, "batch_size 必须是偶数！"
+        assert batch_size % 2 == 0, "batch_size must be even!"
         self.dataset = dataset
         self.batch_size = batch_size
         self.half = batch_size // 2
@@ -610,8 +611,8 @@ class HeuristicBackupHead(nn.Module):
 
         self.precomputed_bayes_prob = precomputed_bayes
         self._key_patterns = {
-            "title": re.compile(r'\btitle\b\s*[:：]?\s*(.+?)(?=\b(price|currency|cententy|brand|title)\b|$)', re.I),
-            "name": re.compile(r'\bname\b\s*[:：]?\s*(.+?)(?=\b(price|currency|cententy|brand|title)\b|$)', re.I),
+            "title": re.compile(r'\btitle\b\s*[:ï¼š]?\s*(.+?)(?=\b(price|currency|cententy|brand|title)\b|$)', re.I),
+            "name": re.compile(r'\bname\b\s*[:ï¼š]?\s*(.+?)(?=\b(price|currency|cententy|brand|title)\b|$)', re.I),
         }
         self.hmodel = hmodel
 
@@ -774,7 +775,7 @@ class _FuzzyMembership(nn.Module):
         return torch.exp(-0.5 * ((x.unsqueeze(-1) - c) / s) ** 2)
 
     def forward(self, x):
-        assert x.size(1) == self.num_inputs, f"输入维度不匹配：期望 {self.num_inputs}，实际 {x.size(1)}"
+        assert x.size(1) == self.num_inputs, f"Input dimension mismatch: expected {self.num_inputs}, got {x.size(1)}"
         mu = [self._gauss(x[:, i], self.centers[i], self.scales[i]) for i in range(self.num_inputs)]
         return torch.cat(mu, dim=1)
 
@@ -931,7 +932,7 @@ class WeightedClassifier(nn.Module):
                  kan_hidden: int | None = None,
                  mlp_hidden_dim: int = 768):
         super().__init__()
-        assert num_chunks >= 2, "num_chunks 至少为 2（x0 和至少一个 xi）"
+        assert num_chunks >= 2, "num_chunks must be at least 2 (x0 and at least one xi)"
         self.num_chunks = num_chunks
         self.per_chunk_dim = per_chunk_dim
         self.concat_size = per_chunk_dim * 2
@@ -971,7 +972,7 @@ class WeightedClassifier(nn.Module):
     def forward(self, x, return_gates: bool = False):
         B, D = x.size()
         expected = self.per_chunk_dim * self.num_chunks
-        assert D == expected, f"输入维度不符：got {D}, expected {expected}"
+        assert D == expected, f"Input dimension mismatch: got {D}, expected {expected}"
 
         x_chunks = torch.split(x, self.per_chunk_dim, dim=1)
         x0 = x_chunks[0]
@@ -1261,7 +1262,7 @@ def supcon_pretrain(train_data, tokenizer, backbone: RobertaModel, max_len: int,
     dual_output("[SupCon] done.")
 
 
-def train(trainData, testData, load=False,
+def train(trainData, valData, load=False,
           idf_dict=None,
           idf_pos=None, idf_neg=None,
           diff_alpha: float = 1.0,
@@ -1272,8 +1273,8 @@ def train(trainData, testData, load=False,
           ):
     model.to(device)
 
-    test_dataset = SentenceSimilarityDataset(testData, max_len, tokenizer, idf_dict)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    val_dataset = SentenceSimilarityDataset(valData, max_len, tokenizer, idf_dict)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     classifier = WeightedClassifier(
         per_chunk_dim=model.config.hidden_size,
@@ -1344,11 +1345,11 @@ def train(trainData, testData, load=False,
             "model": copy.deepcopy(model.state_dict()),
             "classifier": copy.deepcopy(classifier.state_dict()),
             "fuzzy_decision": copy.deepcopy(fuzzy_decision.state_dict())
-
         }
 
         dual_output(
-            f"Loaded best from {save_path} with F1 {best_f1:.4f} at epoch {best_epoch + 1} | thr={best_threshold:.2f}"
+            f"Loaded best from {save_path} with Validation F1 {best_f1:.4f} "
+            f"at epoch {best_epoch + 1} | thr={best_threshold:.2f}"
         )
         _log_lrs(optimizer)
 
@@ -1372,6 +1373,7 @@ def train(trainData, testData, load=False,
             input_ids_list = [batch['input_ids'][i].to(device) for i in range(pairNum)]
             attention_mask_list = [batch['attention_mask'][i].to(device) for i in range(pairNum)]
             labels = batch['labels'].view(-1, 1).float().to(device)
+
             if BACKBONE_TRAIN_VIA_MAIN:
                 sent_list = []
                 for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
@@ -1379,7 +1381,6 @@ def train(trainData, testData, load=False,
                     sent = sentence_pool(outputs.last_hidden_state, attention_mask, POOL_MODE)
                     sent_list.append(sent)
                 combined_outputs = torch.cat(sent_list, dim=1)
-
             else:
                 with torch.no_grad():
                     sent_list = []
@@ -1388,6 +1389,7 @@ def train(trainData, testData, load=False,
                         sent = sentence_pool(outputs.last_hidden_state, attention_mask, POOL_MODE)
                         sent_list.append(sent)
                     combined_outputs = torch.cat(sent_list, dim=1)
+
             z_main = classifier(combined_outputs)
             p_main = torch.sigmoid(z_main)
 
@@ -1406,7 +1408,6 @@ def train(trainData, testData, load=False,
                 feats = torch.cat([v1, v2], dim=0)
                 pos_mask = _pair_pos_mask(batch['labels'].to(device))
                 loss_sup = supcon_loss_minimal(feats, pos_mask, tau=SUPCON_TAU)
-
             else:
                 with torch.no_grad():
                     out1 = model(input_ids=enc1_ids, attention_mask=enc1_attn)
@@ -1437,9 +1438,11 @@ def train(trainData, testData, load=False,
         classifier.eval();
         heuristic_head.eval();
         fuzzy_decision.eval()
+
         all_labels, all_probs = [], []
+
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in val_loader:
                 input_ids_list = [batch['input_ids'][i].to(device) for i in range(pairNum)]
                 attention_mask_list = [batch['attention_mask'][i].to(device) for i in range(pairNum)]
                 labels = batch['labels'].view(-1, 1).float().to(device)
@@ -1449,6 +1452,7 @@ def train(trainData, testData, load=False,
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     sent = sentence_pool(outputs.last_hidden_state, attention_mask, POOL_MODE)
                     sent_list.append(sent)
+
                 combined_outputs = torch.cat(sent_list, dim=1)
                 z_main = classifier(combined_outputs)
                 p_main = torch.sigmoid(z_main)
@@ -1457,11 +1461,11 @@ def train(trainData, testData, load=False,
                 enc1_attn = batch['raw_attention1'].to(device)
                 enc2_ids = batch['raw_input_ids2'].to(device)
                 enc2_attn = batch['raw_attention2'].to(device)
-                with torch.no_grad():
-                    out1 = model(input_ids=enc1_ids, attention_mask=enc1_attn)
-                    out2 = model(input_ids=enc2_ids, attention_mask=enc2_attn)
-                    v1 = sentence_pool(out1.last_hidden_state, enc1_attn, POOL_MODE)
-                    v2 = sentence_pool(out2.last_hidden_state, enc2_attn, POOL_MODE)
+
+                out1 = model(input_ids=enc1_ids, attention_mask=enc1_attn)
+                out2 = model(input_ids=enc2_ids, attention_mask=enc2_attn)
+                v1 = sentence_pool(out1.last_hidden_state, enc1_attn, POOL_MODE)
+                v2 = sentence_pool(out2.last_hidden_state, enc2_attn, POOL_MODE)
 
                 texts1, texts2 = batch['raw_pair']
                 z_backup, gate_feats, p_backup = heuristic_head(
@@ -1479,27 +1483,35 @@ def train(trainData, testData, load=False,
         thresholds = np.arange(0.50, 0.90, 0.005)
 
         f1_best = 0.0
+        thr_best = 0.5
+        acc_best = 0.0
+        pre_best = 0.0
+        rec_best = 0.0
+
         for t in thresholds:
             preds = (probs_arr > t).astype(np.int64)
             acc_t = accuracy_score(labels_arr, preds)
             pre_t = precision_score(labels_arr, preds, zero_division=0)
             rec_t = recall_score(labels_arr, preds, zero_division=0)
             f1_t = f1_score(labels_arr, preds, zero_division=0)
+
             if f1_t >= f1_best:
                 f1_best, thr_best = f1_t, float(t)
                 acc_best, pre_best, rec_best = acc_t, pre_t, rec_t
 
         dual_output(
-            f"Epoch {epoch + 1} (thr={thr_best:.2f}) Test Metrics: "
+            f"Epoch {epoch + 1} (thr={thr_best:.2f}) Validation Metrics: "
             f"Acc {acc_best:.4f} P {pre_best:.4f} R {rec_best:.4f} F1 {f1_best:.4f}"
         )
 
         improved = f1_best >= best_f1
+
         if improved:
             bad_epochs = 0
             best_f1 = f1_best
             best_threshold = thr_best
             best_epoch = epoch
+
             ckpt = {
                 'model_state_dict': model.state_dict(),
                 'classifier_state_dict': classifier.state_dict(),
@@ -1508,8 +1520,8 @@ def train(trainData, testData, load=False,
                 'best_f1': float(best_f1),
                 'best_threshold': float(best_threshold),
                 'fd_state_dict': fuzzy_decision.state_dict()
-
             }
+
             torch.save(ckpt, save_path)
 
             best_snapshots = {
@@ -1517,10 +1529,15 @@ def train(trainData, testData, load=False,
                 "classifier": copy.deepcopy(classifier.state_dict()),
                 "fuzzy_decision": copy.deepcopy(fuzzy_decision.state_dict())
             }
-            dual_output(f"New best saved at epoch {epoch + 1} with F1: {best_f1:.4f} @ thr={best_threshold:.2f}")
+
+            dual_output(
+                f"New best saved at epoch {epoch + 1} "
+                f"with Validation F1: {best_f1:.4f} @ thr={best_threshold:.2f}"
+            )
 
         else:
             bad_epochs += 1
+
             if best_snapshots is not None and (epoch + 1) >= switch_epoch:
                 model.load_state_dict(best_snapshots["model"])
                 classifier.load_state_dict(best_snapshots["classifier"])
@@ -1528,7 +1545,7 @@ def train(trainData, testData, load=False,
 
                 dual_output(
                     f"No improvement, rolled back params to epoch {best_epoch + 1} "
-                    f"(best_F1={best_f1:.4f} @ thr={best_threshold:.2f})"
+                    f"(best_validation_F1={best_f1:.4f} @ thr={best_threshold:.2f})"
                 )
 
         if not improved and bad_epochs >= PATIENCE and epoch > switch_epoch and epoch > SUPCON_EPOCHS:
@@ -1536,8 +1553,8 @@ def train(trainData, testData, load=False,
             bad_epochs = 0
 
     dual_output(
-        f"Training complete. Best F1: {best_f1:.4f} at epoch {best_epoch + 1} | "
-        f"best_threshold={best_threshold:.2f}"
+        f"Training complete. Best Validation F1: {best_f1:.4f} "
+        f"at epoch {best_epoch + 1} | best_threshold={best_threshold:.2f}"
     )
 
 
@@ -1601,6 +1618,7 @@ def eval_detailed(
             writer.writerow(["ID", "s1", "s2", "True", "Pred", "p_final", "p_main", "p_backup"])
 
             idx_global = 0
+
             for batch in test_loader:
                 input_ids_list = [batch['input_ids'][i].to(device) for i in range(pairNum)]
                 attention_mask_list = [batch['attention_mask'][i].to(device) for i in range(pairNum)]
@@ -1611,6 +1629,7 @@ def eval_detailed(
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     sent = sentence_pool(outputs.last_hidden_state, attention_mask, POOL_MODE)
                     sent_list.append(sent)
+
                 combined_outputs = torch.cat(sent_list, dim=1)
                 z_main = classifier(combined_outputs)
                 p_main = torch.sigmoid(z_main)
@@ -1626,9 +1645,11 @@ def eval_detailed(
                 v2 = sentence_pool(out2.last_hidden_state, enc2_attn, POOL_MODE)
 
                 texts1, texts2 = batch['raw_pair']
+
                 z_backup, gate_feats, p_backup = heuristic_head(
                     v1, v2, texts1, texts2, hidden_size=model.config.hidden_size
                 )
+
                 if p_backup is None:
                     p_backup = gate_feats[:, 2:3].clamp(1e-6, 1 - 1e-6)
 
@@ -1653,10 +1674,10 @@ def eval_detailed(
                         f"{pb_i:.6f}"
                     ])
 
-                    all_true.append(t_i);
+                    all_true.append(t_i)
                     all_pred.append(pred_i)
-                    all_p_main.append(pm_i);
-                    all_p_final.append(pf_i);
+                    all_p_main.append(pm_i)
+                    all_p_final.append(pf_i)
                     all_p_backup.append(pb_i)
                     idx_global += 1
 
@@ -1665,11 +1686,16 @@ def eval_detailed(
     rec = recall_score(all_true, all_pred, zero_division=0)
     f1 = f1_score(all_true, all_pred, zero_division=0)
 
-    dual_output("\n[Eval-Detailed] Overall metrics (fixed best_threshold):")
+    dual_output("\n[Eval-Detailed] Overall TEST metrics (fixed validation-selected threshold):")
     dual_output(f"Accuracy: {acc:.4f}  Precision: {pre:.4f}  Recall: {rec:.4f}  F1: {f1:.4f}")
+
     if best_f1_ckpt is not None:
         epoch_show = (best_epoch_ckpt + 1) if best_epoch_ckpt is not None else '?'
-        dual_output(f"[History(best)] F1={best_f1_ckpt:.4f} @ thr={best_threshold:.2f} (epoch {epoch_show})")
+        dual_output(
+            f"[Validation best] F1={best_f1_ckpt:.4f} "
+            f"@ thr={best_threshold:.2f} (epoch {epoch_show})"
+        )
+
     dual_output(f"Per-sample CSV written to: {result_file}")
 
     return {
@@ -1733,6 +1759,7 @@ def extract_features_and_labels(train_data, tokenizer, max_len, batch_size, idf_
                 v2 = sentence_pool(out2.last_hidden_state, enc2_attn, POOL_MODE)
 
             texts1, texts2 = batch['raw_pair']
+
             z_backup, gate_feats, p_backup = heuristic_head(
                 v1, v2, texts1, texts2, hidden_size=model.config.hidden_size
             )
@@ -1763,41 +1790,111 @@ def svm_evaluate_model(svm_model, test_features, test_labels):
 
 if __name__ == "__main__":
     dual_output("load trainData, testData")
-    trainData, augTrainData, testData, pairNum = getData(path, trainpath, testpath)
+
+    trainData, _, testData, pairNum = getData(path, trainpath, testpath)
+
+    # ------------------------------------------------------------
+    # Honest model selection:
+    # 1) Split ONLY the original training set.
+    # 2) Perform augmentation ONLY on the fitting subset.
+    # 3) Build IDF/Bayes/SVM statistics only from fitting data.
+    # 4) Validation set selects epoch and threshold.
+    # 5) Test set is used only once after training.
+    # ------------------------------------------------------------
+    VAL_RATIO = 0.20
+    SPLIT_SEED = 42
+
+    split_labels = [int(row[-1]) for row in trainData]
+
+    trainFitData, valData = train_test_split(
+        trainData,
+        test_size=VAL_RATIO,
+        random_state=SPLIT_SEED,
+        stratify=split_labels
+    )
+
+    augTrainData = data_augment(trainFitData)
+
+    dual_output(
+        f"[Data Split] train-fit={len(trainFitData)}, "
+        f"aug-train={len(augTrainData)}, "
+        f"validation={len(valData)}, "
+        f"test={len(testData)}"
+    )
 
     IDF_CORPUS_SOURCE = 'train'
-    if IDF_CORPUS_SOURCE == 'train':
-        idf_dict, N_docs = build_global_idf_from_pairs(trainData)
-    else:
-        idf_dict, N_docs = build_global_idf_from_pairs(testData)
+
+    idf_dict, N_docs = build_global_idf_from_pairs(trainFitData)
     dual_output(f"[Global IDF] built with {N_docs} docs, vocab size={len(idf_dict)}")
 
-    idf_pos, idf_neg, N_pos, N_neg = build_class_idf_from_pairs(trainData)
-    dual_output(f"[Class IDF] pos_docs={N_pos}, neg_docs={N_neg}, |idf_pos|={len(idf_pos)}, |idf_neg|={len(idf_neg)}")
+    idf_pos, idf_neg, N_pos, N_neg = build_class_idf_from_pairs(trainFitData)
+    dual_output(
+        f"[Class IDF] pos_docs={N_pos}, neg_docs={N_neg}, "
+        f"|idf_pos|={len(idf_pos)}, |idf_neg|={len(idf_neg)}"
+    )
 
-    precomputed_bayes = build_bayes_prob_from_pairs(trainData, k=1.0, beta_pos=1.0, beta_neg=1.0)
+    precomputed_bayes = build_bayes_prob_from_pairs(
+        trainFitData,
+        k=1.0,
+        beta_pos=1.0,
+        beta_neg=1.0
+    )
     dual_output(f"[Bayes Prob] built with {len(precomputed_bayes)} tokens")
 
-    dual_output("Extracting features and labels for training and testing")
-    svm_features, svm_labels = extract_features_and_labels(augTrainData, tokenizer, max_len, batch_size=64,
-                                                           idf_dict=idf_dict, idf_pos=idf_pos, idf_neg=idf_neg,
-                                                           precomputed_bayes=precomputed_bayes, pairNum=pairNum)
-    svm_test_features, svm_test_labels = extract_features_and_labels(testData, tokenizer, max_len, batch_size=64,
-                                                                     idf_dict=idf_dict, idf_pos=idf_pos,
-                                                                     idf_neg=idf_neg,
-                                                                     precomputed_bayes=precomputed_bayes,
-                                                                     pairNum=pairNum)
+    dual_output("Extracting features and labels for training and validation")
+
+    svm_features, svm_labels = extract_features_and_labels(
+        augTrainData,
+        tokenizer,
+        max_len,
+        batch_size=64,
+        idf_dict=idf_dict,
+        idf_pos=idf_pos,
+        idf_neg=idf_neg,
+        precomputed_bayes=precomputed_bayes,
+        pairNum=pairNum
+    )
+
+    svm_val_features, svm_val_labels = extract_features_and_labels(
+        valData,
+        tokenizer,
+        max_len,
+        batch_size=64,
+        idf_dict=idf_dict,
+        idf_pos=idf_pos,
+        idf_neg=idf_neg,
+        precomputed_bayes=precomputed_bayes,
+        pairNum=pairNum
+    )
 
     dual_output("Training SVM model")
     svm_model = train_svm_model(svm_features, svm_labels)
-    dual_output(f"Evaluating the SVM model")
-    svm_evaluate_model(svm_model, svm_test_features, svm_test_labels)
 
-    train(augTrainData, testData, load=False,
-          idf_dict=idf_dict, idf_pos=idf_pos, idf_neg=idf_neg,
-          precomputed_bayes=precomputed_bayes, hmodel=svm_model)
+    dual_output("Evaluating the SVM model on validation set")
+    svm_evaluate_model(
+        svm_model,
+        svm_val_features,
+        svm_val_labels
+    )
 
-    dual_output("Starting evaluation (detailed per-sample dump)...")
-    eval_detailed(testData,
-                  idf_dict=idf_dict, idf_pos=idf_pos, idf_neg=idf_neg,
-                  precomputed_bayes=precomputed_bayes, hmodel=svm_model)
+    train(
+        augTrainData,
+        valData,
+        load=False,
+        idf_dict=idf_dict,
+        idf_pos=idf_pos,
+        idf_neg=idf_neg,
+        precomputed_bayes=precomputed_bayes,
+        hmodel=svm_model
+    )
+
+    dual_output("Starting final TEST evaluation (detailed per-sample dump)...")
+
+    eval_detailed(
+        testData,
+        idf_dict=idf_dict,
+        idf_pos=idf_pos,
+        idf_neg=idf_neg,
+        precomputed_bayes=precomputed_bayes,
+        hmodel=svm_model
+    )
